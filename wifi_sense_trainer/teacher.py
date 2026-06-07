@@ -232,7 +232,7 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
             min_pose_conf=0.5, max_samples=0, fps=8.0, append=False,
             stereo_width=0, baseline_m=0.065, focal_px=400.0,
             swap_eyes=False, flip_v=False, mirror_h=False, calib=None, rotate180=False,
-            imu=None, imu_baud=115200):
+            imu=None, imu_baud=115200, checkpoint=100):
     import cv2  # noqa
     os.makedirs(out, exist_ok=True)
     tol = align_ms / 1000.0
@@ -254,6 +254,53 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
 
     csi_rows, kp_rows, errs, quat_rows = [], [], [], []
     frames = detections = 0
+    cp, kpp = os.path.join(out, "csi_amplitude.npy"), os.path.join(out, "keypoints.npy")
+    qp = os.path.join(out, "quaternion.npy")
+    # base arrays (append mode): loaded ONCE so checkpoints don't re-append repeatedly
+    base_csi = base_kp = base_quat = None
+    if append:
+        try:
+            base_csi, base_kp = np.load(cp), np.load(kpp)
+        except Exception:
+            base_csi = base_kp = None
+        try:
+            base_quat = np.load(qp)
+        except Exception:
+            base_quat = None
+
+    def _atomic_npy(path, arr):
+        tmp = path + ".tmp"
+        np.save(tmp, arr)                 # numpy appends .npy
+        os.replace(tmp + ".npy", path)
+
+    def _save():
+        # Durable checkpoint: combine base (append) + this session, atomic-write.
+        # A kill between checkpoints loses at most `checkpoint` samples, never all.
+        if not csi_rows:
+            return 0
+        csi_arr = np.asarray(csi_rows, dtype=np.float32)
+        kp_arr = np.asarray(kp_rows, dtype=np.float32)
+        if base_csi is not None and base_kp is not None and base_csi.shape[0] == base_kp.shape[0]:
+            csi_arr = np.concatenate([base_csi, csi_arr], 0)
+            kp_arr = np.concatenate([base_kp, kp_arr], 0)
+        _atomic_npy(cp, csi_arr)
+        _atomic_npy(kpp, kp_arr)
+        has_imu = len(quat_rows) == len(csi_rows) and len(quat_rows) > 0
+        if has_imu:
+            q = np.asarray(quat_rows, dtype=np.float32)
+            if base_quat is not None and base_quat.shape[0] == csi_arr.shape[0] - q.shape[0]:
+                q = np.concatenate([base_quat, q], 0)
+            _atomic_npy(qp, q)
+        n_tot = csi_arr.shape[0]
+        meta = {"samples": n_tot, "n_subcarriers": N_SUB, "backend": teacher.name, "fuse": fuse,
+                "keypoint_format": "COCO17_xyz_normalized", "coco_order": COCO_NAMES,
+                "align_ms_mean": (sum(errs) / len(errs) * 1000) if errs else 0,
+                "frames_seen": frames, "poses_detected": detections, "dataset_type": "mmfi",
+                "has_orientation": has_imu, "orientation_format": "quaternion_wxyz_rig" if has_imu else None}
+        mtmp = os.path.join(out, "meta.json.tmp")
+        json.dump(meta, open(mtmp, "w"), indent=2)
+        os.replace(mtmp, os.path.join(out, "meta.json"))
+        return n_tot
     stop = {"v": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("v", True))
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("v", True))
@@ -276,6 +323,9 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
                     csi_rows.append(amp); kp_rows.append(kp.reshape(-1)); errs.append(dt)
                     if imu_reader is not None:
                         quat_rows.append(imu_reader.latest_quat())
+                    if checkpoint and len(csi_rows) % checkpoint == 0:
+                        _save()
+                        print(f"  [checkpoint] flushed {len(csi_rows)} session samples to {out}/", flush=True)
             if time.time() - last >= 1.0:
                 with csi.lock:
                     cf, nc = csi.frames, csi.node_count
@@ -294,46 +344,14 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
             print(f"[imu] {imu_reader.packets} packets, {imu_reader.invalid} invalid")
             imu_reader.stop()
 
-    n = len(csi_rows)
-    if n == 0:
+    if len(csi_rows) == 0:
         print("[teacher] no paired samples — nothing saved.", file=sys.stderr)
         return 1
-    csi_arr = np.asarray(csi_rows, dtype=np.float32)
-    kp_arr = np.asarray(kp_rows, dtype=np.float32)
-    cp, kpp = os.path.join(out, "csi_amplitude.npy"), os.path.join(out, "keypoints.npy")
-    if append and os.path.exists(cp) and os.path.exists(kpp):
-        try:
-            csi_arr = np.concatenate([np.load(cp), csi_arr], 0)
-            kp_arr = np.concatenate([np.load(kpp), kp_arr], 0)
-            print(f"[teacher] appended -> {csi_arr.shape[0]} total samples")
-        except Exception as e:
-            print(f"[teacher] append failed ({e}); writing this session only", file=sys.stderr)
-    np.save(cp, csi_arr)
-    np.save(kpp, kp_arr)
+    n = _save()
     has_imu = len(quat_rows) == len(csi_rows) and len(quat_rows) > 0
-    qp = os.path.join(out, "quaternion.npy")
-    if has_imu:
-        quat_arr = np.asarray(quat_rows, dtype=np.float32)  # (this_session, 4) wxyz
-        if append and os.path.exists(qp):
-            try:
-                prev = np.load(qp)
-                # keep rows aligned with csi/kp; pad/truncate prior if mismatched
-                if prev.shape[0] == csi_arr.shape[0] - quat_arr.shape[0]:
-                    quat_arr = np.concatenate([prev, quat_arr], 0)
-            except Exception as e:
-                print(f"[teacher] quat append failed ({e}); writing this session only", file=sys.stderr)
-        np.save(qp, quat_arr)
-        print(f"[teacher] saved {quat_arr.shape[0]} rig-orientation quaternions -> {qp}")
-    n = csi_arr.shape[0]
-    json.dump({"samples": n, "n_subcarriers": N_SUB, "backend": teacher.name, "fuse": fuse,
-               "keypoint_format": "COCO17_xyz_normalized", "coco_order": COCO_NAMES,
-               "align_ms_mean": (sum(errs) / n * 1000) if errs else 0,
-               "frames_seen": frames, "poses_detected": detections, "dataset_type": "mmfi",
-               "has_orientation": has_imu, "orientation_format": "quaternion_wxyz_rig" if has_imu else None},
-              open(os.path.join(out, "meta.json"), "w"), indent=2)
     print(f"[teacher] saved {n} samples -> {out}/ "
-          f"(csi {N_SUB}, kp {N_KP*3}; mean align "
-          f"{(sum(errs)/n*1000) if errs else 0:.0f}ms)")
+          f"(csi {N_SUB}, kp {N_KP*3}{', +quat' if has_imu else ''}; mean align "
+          f"{(sum(errs)/len(errs)*1000) if errs else 0:.0f}ms)")
     return 0
 
 
@@ -349,6 +367,7 @@ def main():
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--fps", type=float, default=8.0)
     ap.add_argument("--append", action="store_true", help="accumulate onto existing dataset")
+    ap.add_argument("--checkpoint", type=int, default=100, help="flush to disk every N samples (0=only at end)")
     # stereo (--backend stereo): vr-passthrough SBS USB cam defaults
     ap.add_argument("--stereo-width", type=int, default=800, help="SBS device capture width (total)")
     ap.add_argument("--baseline", type=float, default=0.065, help="camera baseline in metres")
@@ -365,7 +384,7 @@ def main():
     sys.exit(collect(a.ws, a.camera, a.out, a.backend, a.fuse, a.align_ms,
                      a.min_pose_conf, a.max_samples, a.fps, a.append,
                      a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h, a.calib, a.rotate_180,
-                     a.imu, a.imu_baud))
+                     a.imu, a.imu_baud, a.checkpoint))
 
 
 if __name__ == "__main__":
