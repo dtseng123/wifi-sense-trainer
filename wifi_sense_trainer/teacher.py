@@ -19,13 +19,18 @@ from .csi import fuse_amplitude, SensingWS, N_SUB
 class FrameSource:
     """OpenCV V4L2/RTSP, or an HTTP JPEG snapshot endpoint (CSI/libcamera-safe)."""
 
-    def __init__(self, spec):
+    def __init__(self, spec, width=0, height=0):
         self.spec = str(spec)
         self.is_url = self.spec.startswith("http")
         self.cap = None
         if not self.is_url:
             import cv2
             self.cap = cv2.VideoCapture(int(self.spec) if self.spec.isdigit() else self.spec)
+            if self.cap and width:
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                if height:
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
     def opened(self):
         return True if self.is_url else bool(self.cap and self.cap.isOpened())
@@ -92,8 +97,70 @@ class MediaPipeTeacher:
         return kp, float(np.mean(confs))
 
 
-def make_teacher(backend, min_conf):
-    return MediaPipeTeacher(min_conf) if backend == "mediapipe" else YoloTeacher(min_conf)
+def _split_sbs(frame, swap=False, flip_v=False, mirror_h=False):
+    """Split a side-by-side stereo frame into (left, right) eyes."""
+    import cv2
+    half = frame.shape[1] // 2
+    a, b = frame[:, :half], frame[:, half:half * 2]
+    left, right = (b, a) if swap else (a, b)
+    if flip_v:
+        left, right = cv2.flip(left, 0), cv2.flip(right, 0)
+    if mirror_h:
+        left, right = cv2.flip(left, 1), cv2.flip(right, 1)
+    return left, right
+
+
+class StereoTeacher:
+    """Metric-depth teacher: 2D pose on the LEFT eye + stereo disparity -> z per
+    keypoint. Defaults match the vr-passthrough USB SBS camera (baseline 65mm,
+    focal 400px). z is normalized to [0,1] over [z_min,z_max] metres for the model.
+    Runs on the existing 3.13 venv (YOLO + OpenCV) — no MediaPipe needed."""
+    name = "stereo"
+
+    def __init__(self, min_conf=0.5, baseline_m=0.065, focal_px=400.0,
+                 swap_eyes=False, flip_v=True, mirror_h=True,
+                 z_min=0.3, z_max=5.0, pose_backend="yolo"):
+        import cv2
+        self.pose = make_teacher(pose_backend, min_conf)  # 2D keypoints on left eye
+        self.baseline, self.focal = baseline_m, focal_px
+        self.swap, self.flip_v, self.mirror_h = swap_eyes, flip_v, mirror_h
+        self.z_min, self.z_max = z_min, z_max
+        self.matcher = cv2.StereoSGBM_create(
+            minDisparity=0, numDisparities=96, blockSize=7,
+            P1=8 * 3 * 49, P2=32 * 3 * 49, uniquenessRatio=10,
+            speckleWindowSize=50, speckleRange=2, disp12MaxDiff=1)
+
+    def infer(self, frame):
+        import cv2
+        left, right = _split_sbs(frame, self.swap, self.flip_v, self.mirror_h)
+        kp, conf = self.pose.infer(left)  # x,y normalized to LEFT eye
+        if kp is None:
+            return None, 0.0
+        gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+        gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+        disp = self.matcher.compute(gl, gr).astype(np.float32) / 16.0  # pixels
+        H, W = gl.shape
+        span = max(self.z_max - self.z_min, 1e-6)
+        for i in range(N_KP):
+            x = int(min(max(kp[i, 0] * W, 0), W - 1))
+            y = int(min(max(kp[i, 1] * H, 0), H - 1))
+            win = disp[max(0, y - 3):y + 4, max(0, x - 3):x + 4]
+            valid = win[win > 0.5]
+            if valid.size:
+                d = float(np.median(valid))
+                z = (self.baseline * self.focal) / d  # metres
+                kp[i, 2] = (min(max(z, self.z_min), self.z_max) - self.z_min) / span
+            else:
+                kp[i, 2] = 0.0
+        return kp, conf
+
+
+def make_teacher(backend, min_conf, **kw):
+    if backend == "mediapipe":
+        return MediaPipeTeacher(min_conf)
+    if backend == "stereo":
+        return StereoTeacher(min_conf, **kw)
+    return YoloTeacher(min_conf)
 
 
 # ── CSI ring buffer (fed by SensingWS) ─────────────────────────────────────
@@ -138,14 +205,18 @@ class CsiBuffer:
 
 
 def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
-            min_pose_conf=0.5, max_samples=0, fps=8.0, append=False):
+            min_pose_conf=0.5, max_samples=0, fps=8.0, append=False,
+            stereo_width=0, baseline_m=0.065, focal_px=400.0,
+            swap_eyes=False, flip_v=True, mirror_h=True):
     import cv2  # noqa
     os.makedirs(out, exist_ok=True)
     tol = align_ms / 1000.0
-    teacher = make_teacher(backend, min_pose_conf)
+    teacher = (make_teacher("stereo", min_pose_conf, baseline_m=baseline_m, focal_px=focal_px,
+                            swap_eyes=swap_eyes, flip_v=flip_v, mirror_h=mirror_h)
+               if backend == "stereo" else make_teacher(backend, min_pose_conf))
     csi = CsiBuffer(ws, fuse)
     csi.start()
-    cap = FrameSource(camera)
+    cap = FrameSource(camera, stereo_width)
     if not cap.opened():
         print(f"[teacher] ERROR: cannot open camera {camera}", file=sys.stderr)
         return 1
@@ -220,16 +291,24 @@ def main():
     ap.add_argument("--ws", default="ws://localhost:13000/ws/sensing")
     ap.add_argument("--camera", default="http://localhost:8080/api/vision/snapshot?camera=0")
     ap.add_argument("--out", default="dataset")
-    ap.add_argument("--backend", choices=["yolo", "mediapipe"], default="yolo")
+    ap.add_argument("--backend", choices=["yolo", "mediapipe", "stereo"], default="yolo")
     ap.add_argument("--fuse", choices=["mean", "node0"], default="mean")
     ap.add_argument("--align-ms", type=float, default=60.0)
     ap.add_argument("--min-pose-conf", type=float, default=0.5)
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--fps", type=float, default=8.0)
     ap.add_argument("--append", action="store_true", help="accumulate onto existing dataset")
+    # stereo (--backend stereo): vr-passthrough SBS USB cam defaults
+    ap.add_argument("--stereo-width", type=int, default=800, help="SBS device capture width (total)")
+    ap.add_argument("--baseline", type=float, default=0.065, help="camera baseline in metres")
+    ap.add_argument("--focal", type=float, default=400.0, help="focal length in pixels")
+    ap.add_argument("--swap-eyes", action="store_true")
+    ap.add_argument("--no-flip-v", dest="flip_v", action="store_false")
+    ap.add_argument("--no-mirror-h", dest="mirror_h", action="store_false")
     a = ap.parse_args()
     sys.exit(collect(a.ws, a.camera, a.out, a.backend, a.fuse, a.align_ms,
-                     a.min_pose_conf, a.max_samples, a.fps, a.append))
+                     a.min_pose_conf, a.max_samples, a.fps, a.append,
+                     a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h))
 
 
 if __name__ == "__main__":
