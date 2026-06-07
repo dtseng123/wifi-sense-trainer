@@ -138,7 +138,7 @@ class CsiBuffer:
 
 
 def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
-            min_pose_conf=0.5, max_samples=0, fps=8.0):
+            min_pose_conf=0.5, max_samples=0, fps=8.0, append=False):
     import cv2  # noqa
     os.makedirs(out, exist_ok=True)
     tol = align_ms / 1000.0
@@ -191,8 +191,19 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
     if n == 0:
         print("[teacher] no paired samples — nothing saved.", file=sys.stderr)
         return 1
-    np.save(os.path.join(out, "csi_amplitude.npy"), np.asarray(csi_rows, dtype=np.float32))
-    np.save(os.path.join(out, "keypoints.npy"), np.asarray(kp_rows, dtype=np.float32))
+    csi_arr = np.asarray(csi_rows, dtype=np.float32)
+    kp_arr = np.asarray(kp_rows, dtype=np.float32)
+    cp, kpp = os.path.join(out, "csi_amplitude.npy"), os.path.join(out, "keypoints.npy")
+    if append and os.path.exists(cp) and os.path.exists(kpp):
+        try:
+            csi_arr = np.concatenate([np.load(cp), csi_arr], 0)
+            kp_arr = np.concatenate([np.load(kpp), kp_arr], 0)
+            print(f"[teacher] appended -> {csi_arr.shape[0]} total samples")
+        except Exception as e:
+            print(f"[teacher] append failed ({e}); writing this session only", file=sys.stderr)
+    np.save(cp, csi_arr)
+    np.save(kpp, kp_arr)
+    n = csi_arr.shape[0]
     json.dump({"samples": n, "n_subcarriers": N_SUB, "backend": teacher.name, "fuse": fuse,
                "keypoint_format": "COCO17_xyz_normalized", "coco_order": COCO_NAMES,
                "align_ms_mean": (sum(errs) / n * 1000) if errs else 0,
@@ -215,9 +226,10 @@ def main():
     ap.add_argument("--min-pose-conf", type=float, default=0.5)
     ap.add_argument("--max-samples", type=int, default=0)
     ap.add_argument("--fps", type=float, default=8.0)
+    ap.add_argument("--append", action="store_true", help="accumulate onto existing dataset")
     a = ap.parse_args()
     sys.exit(collect(a.ws, a.camera, a.out, a.backend, a.fuse, a.align_ms,
-                     a.min_pose_conf, a.max_samples, a.fps))
+                     a.min_pose_conf, a.max_samples, a.fps, a.append))
 
 
 if __name__ == "__main__":
