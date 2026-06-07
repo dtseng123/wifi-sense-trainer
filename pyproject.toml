@@ -21,6 +21,7 @@ dependencies = [
 torch = ["torch>=2.0"]
 teacher = ["opencv-python>=4.8", "ultralytics>=8.0"]
 mediapipe = ["mediapipe>=0.10"]  # python<=3.12 only
+imu = ["pyserial>=3.5"]  # rig-orientation tagging via --imu
 dev = ["pytest>=7"]
 
 [project.scripts]

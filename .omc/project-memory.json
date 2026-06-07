@@ -88,6 +88,24 @@
       "accessCount": 2,
       "lastAccessed": 1780848713349,
       "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 2,
+      "lastAccessed": 1780849300364,
+      "type": "file"
+    },
+    {
+      "path": "wifi_sense_trainer/teacher.py",
+      "accessCount": 1,
+      "lastAccessed": 1780849149686,
+      "type": "file"
+    },
+    {
+      "path": "wifi_sense_trainer/imu.py",
+      "accessCount": 1,
+      "lastAccessed": 1780849173137,
+      "type": "file"
     }
   ],
   "userDirectives": []

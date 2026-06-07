@@ -231,13 +231,20 @@ class CsiBuffer:
 def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
             min_pose_conf=0.5, max_samples=0, fps=8.0, append=False,
             stereo_width=0, baseline_m=0.065, focal_px=400.0,
-            swap_eyes=False, flip_v=False, mirror_h=False, calib=None, rotate180=False):
+            swap_eyes=False, flip_v=False, mirror_h=False, calib=None, rotate180=False,
+            imu=None, imu_baud=115200):
     import cv2  # noqa
     os.makedirs(out, exist_ok=True)
     tol = align_ms / 1000.0
     teacher = (make_teacher("stereo", min_pose_conf, baseline_m=baseline_m, focal_px=focal_px,
                             swap_eyes=swap_eyes, flip_v=flip_v, mirror_h=mirror_h, calib=calib, rotate180=rotate180)
                if backend == "stereo" else make_teacher(backend, min_pose_conf))
+    imu_reader = None
+    if imu:
+        from .imu import ImuReader
+        imu_reader = ImuReader(imu, imu_baud)
+        if not imu_reader.start():
+            imu_reader = None
     csi = CsiBuffer(ws, fuse)
     csi.start()
     cap = FrameSource(camera, stereo_width)
@@ -245,7 +252,7 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
         print(f"[teacher] ERROR: cannot open camera {camera}", file=sys.stderr)
         return 1
 
-    csi_rows, kp_rows, errs = [], [], []
+    csi_rows, kp_rows, errs, quat_rows = [], [], [], []
     frames = detections = 0
     stop = {"v": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("v", True))
@@ -267,6 +274,8 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
                 amp, dt = csi.nearest(ts, tol)
                 if amp is not None:
                     csi_rows.append(amp); kp_rows.append(kp.reshape(-1)); errs.append(dt)
+                    if imu_reader is not None:
+                        quat_rows.append(imu_reader.latest_quat())
             if time.time() - last >= 1.0:
                 with csi.lock:
                     cf, nc = csi.frames, csi.node_count
@@ -281,6 +290,9 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
                 time.sleep(d)
     finally:
         cap.release(); csi.stop()
+        if imu_reader is not None:
+            print(f"[imu] {imu_reader.packets} packets, {imu_reader.invalid} invalid")
+            imu_reader.stop()
 
     n = len(csi_rows)
     if n == 0:
@@ -298,11 +310,26 @@ def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
             print(f"[teacher] append failed ({e}); writing this session only", file=sys.stderr)
     np.save(cp, csi_arr)
     np.save(kpp, kp_arr)
+    has_imu = len(quat_rows) == len(csi_rows) and len(quat_rows) > 0
+    qp = os.path.join(out, "quaternion.npy")
+    if has_imu:
+        quat_arr = np.asarray(quat_rows, dtype=np.float32)  # (this_session, 4) wxyz
+        if append and os.path.exists(qp):
+            try:
+                prev = np.load(qp)
+                # keep rows aligned with csi/kp; pad/truncate prior if mismatched
+                if prev.shape[0] == csi_arr.shape[0] - quat_arr.shape[0]:
+                    quat_arr = np.concatenate([prev, quat_arr], 0)
+            except Exception as e:
+                print(f"[teacher] quat append failed ({e}); writing this session only", file=sys.stderr)
+        np.save(qp, quat_arr)
+        print(f"[teacher] saved {quat_arr.shape[0]} rig-orientation quaternions -> {qp}")
     n = csi_arr.shape[0]
     json.dump({"samples": n, "n_subcarriers": N_SUB, "backend": teacher.name, "fuse": fuse,
                "keypoint_format": "COCO17_xyz_normalized", "coco_order": COCO_NAMES,
                "align_ms_mean": (sum(errs) / n * 1000) if errs else 0,
-               "frames_seen": frames, "poses_detected": detections, "dataset_type": "mmfi"},
+               "frames_seen": frames, "poses_detected": detections, "dataset_type": "mmfi",
+               "has_orientation": has_imu, "orientation_format": "quaternion_wxyz_rig" if has_imu else None},
               open(os.path.join(out, "meta.json"), "w"), indent=2)
     print(f"[teacher] saved {n} samples -> {out}/ "
           f"(csi {N_SUB}, kp {N_KP*3}; mean align "
@@ -331,10 +358,14 @@ def main():
     ap.add_argument("--mirror-h", action="store_true", help="(display only; breaks stereo geometry)")
     ap.add_argument("--calib", default=None, help="stereo_calib.json from wst-calibrate (metric depth)")
     ap.add_argument("--rotate-180", action="store_true", help="camera mounted upside down")
+    # optional rig IMU (co-mounted with the camera): tags each sample with orientation
+    ap.add_argument("--imu", default=None, help="IMU serial port (e.g. /dev/ttyACM0) to stamp rig orientation per sample")
+    ap.add_argument("--imu-baud", type=int, default=115200)
     a = ap.parse_args()
     sys.exit(collect(a.ws, a.camera, a.out, a.backend, a.fuse, a.align_ms,
                      a.min_pose_conf, a.max_samples, a.fps, a.append,
-                     a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h, a.calib, a.rotate_180))
+                     a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h, a.calib, a.rotate_180,
+                     a.imu, a.imu_baud))
 
 
 if __name__ == "__main__":

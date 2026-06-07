@@ -67,6 +67,26 @@ wst-infer --model-dir dataset --ws ws://HOST:13000/ws/sensing \
           --sink http://HOST:8080/api/ruview/pose       # or --sink print
 ```
 
+### Stereo depth + a movable rig (optional)
+A side-by-side USB stereo camera gives the teacher true metric depth (Z), so the
+trained head predicts 3D pose instead of 2D:
+```bash
+# one-time stereo calibration (show a checkerboard to both eyes)
+wst-calibrate --camera /dev/video16 --width 1280 --cols 9 --rows 6 \
+              --square-mm <measured> --rotate-180 --out dataset/stereo_calib.json
+# collect with depth (--rotate-180 if the camera is mounted upside down)
+wst-collect --backend stereo --camera /dev/video16 --stereo-width 1280 \
+            --rotate-180 --calib dataset/stereo_calib.json \
+            --ws ws://HOST:13000/ws/sensing --out dataset --append
+```
+If you co-mount an IMU with the camera (e.g. a VR-headset sensor hub on
+`/dev/ttyACM0`), add `--imu /dev/ttyACM0` to stamp each sample with the rig's
+orientation quaternion (`quaternion.npy`, wxyz). This is the path to a **movable
+rig**: the dataset records the orientation each sample was taken at, so the head
+can be made orientation-aware instead of needing a full retrain on every move.
+Needs `pip install wifi-sense-trainer[imu]`; the packet format is a 35-byte
+`0xAA … 0x55` frame (uint32 ms, quat wxyz f32, accel xyz f32, xor checksum).
+
 ## Design / reuse
 - **`csi`** — `fuse_amplitude`, `Normalizer`, `SensingWS` (reconnecting `/ws/sensing` client).
 - **`coco`** — COCO-17 names, BlazePose→COCO map, skeleton edges.
