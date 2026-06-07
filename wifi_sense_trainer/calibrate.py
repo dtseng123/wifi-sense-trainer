@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--min-move", type=float, default=30.0, help="min mean corner shift (px) to accept a new pair")
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--swap-eyes", action="store_true")
+    ap.add_argument("--rotate-180", action="store_true", help="camera mounted upside down")
     ap.add_argument("--out", default="stereo_calib.json")
     a = ap.parse_args()
     import cv2
@@ -63,6 +64,8 @@ def main():
         ok, f = cap.read()
         if not ok:
             time.sleep(0.02); continue
+        if a.rotate_180:
+            f = cv2.rotate(f, cv2.ROTATE_180)
         half = f.shape[1] // 2
         l, r = f[:, :half], f[:, half:half * 2]
         if a.swap_eyes:

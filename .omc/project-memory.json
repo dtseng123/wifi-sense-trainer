@@ -1,0 +1,94 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1780848702615,
+  "projectRoot": "/home/dash/wifi-sense-trainer",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "pytest",
+        "version": null,
+        "category": "testing"
+      }
+    ],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 1,
+      "lastAccessed": 1780848702604,
+      "keyFiles": [
+        "test_basic.py"
+      ]
+    },
+    "wifi_sense_trainer": {
+      "path": "wifi_sense_trainer",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1780848702610,
+      "keyFiles": [
+        "__init__.py",
+        "calibrate.py",
+        "coco.py",
+        "csi.py",
+        "infer.py"
+      ]
+    },
+    "wifi_sense_trainer.egg-info": {
+      "path": "wifi_sense_trainer.egg-info",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1780848702610,
+      "keyFiles": [
+        "PKG-INFO",
+        "SOURCES.txt",
+        "dependency_links.txt",
+        "entry_points.txt",
+        "requires.txt"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "wifi_sense_trainer/calibrate.py",
+      "accessCount": 2,
+      "lastAccessed": 1780848713349,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

@@ -97,9 +97,13 @@ class MediaPipeTeacher:
         return kp, float(np.mean(confs))
 
 
-def _split_sbs(frame, swap=False, flip_v=False, mirror_h=False):
-    """Split a side-by-side stereo frame into (left, right) eyes."""
+def _split_sbs(frame, swap=False, flip_v=False, mirror_h=False, rotate180=False):
+    """Split a side-by-side stereo frame into (left, right) eyes.
+    rotate180 (for an upside-down camera) rotates the FULL frame first so eyes
+    come out upright with the correct left/right order."""
     import cv2
+    if rotate180:
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
     half = frame.shape[1] // 2
     a, b = frame[:, :half], frame[:, half:half * 2]
     left, right = (b, a) if swap else (a, b)
@@ -120,12 +124,12 @@ class StereoTeacher:
     name = "stereo"
 
     def __init__(self, min_conf=0.5, baseline_m=0.065, focal_px=400.0,
-                 swap_eyes=False, flip_v=False, mirror_h=False,
+                 swap_eyes=False, flip_v=False, mirror_h=False, rotate180=False,
                  z_min=0.3, z_max=5.0, pose_backend="yolo", calib=None):
         import cv2
         self.pose = make_teacher(pose_backend, min_conf)
         self.baseline, self.focal = baseline_m, focal_px
-        self.swap, self.flip_v, self.mirror_h = swap_eyes, flip_v, mirror_h
+        self.swap, self.flip_v, self.mirror_h, self.rotate180 = swap_eyes, flip_v, mirror_h, rotate180
         self.z_min, self.z_max = z_min, z_max
         self.matcher = cv2.StereoSGBM_create(
             minDisparity=0, numDisparities=96, blockSize=7,
@@ -147,7 +151,7 @@ class StereoTeacher:
 
     def infer(self, frame):
         import cv2
-        left, right = _split_sbs(frame, self.swap, self.flip_v, self.mirror_h)
+        left, right = _split_sbs(frame, self.swap, self.flip_v, self.mirror_h, self.rotate180)
         if self.rect:
             left = cv2.remap(left, self.m1[0], self.m1[1], cv2.INTER_LINEAR)
             right = cv2.remap(right, self.m2[0], self.m2[1], cv2.INTER_LINEAR)
@@ -227,12 +231,12 @@ class CsiBuffer:
 def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
             min_pose_conf=0.5, max_samples=0, fps=8.0, append=False,
             stereo_width=0, baseline_m=0.065, focal_px=400.0,
-            swap_eyes=False, flip_v=False, mirror_h=False, calib=None):
+            swap_eyes=False, flip_v=False, mirror_h=False, calib=None, rotate180=False):
     import cv2  # noqa
     os.makedirs(out, exist_ok=True)
     tol = align_ms / 1000.0
     teacher = (make_teacher("stereo", min_pose_conf, baseline_m=baseline_m, focal_px=focal_px,
-                            swap_eyes=swap_eyes, flip_v=flip_v, mirror_h=mirror_h, calib=calib)
+                            swap_eyes=swap_eyes, flip_v=flip_v, mirror_h=mirror_h, calib=calib, rotate180=rotate180)
                if backend == "stereo" else make_teacher(backend, min_pose_conf))
     csi = CsiBuffer(ws, fuse)
     csi.start()
@@ -326,10 +330,11 @@ def main():
     ap.add_argument("--flip-v", action="store_true", help="(display only; leave off for depth)")
     ap.add_argument("--mirror-h", action="store_true", help="(display only; breaks stereo geometry)")
     ap.add_argument("--calib", default=None, help="stereo_calib.json from wst-calibrate (metric depth)")
+    ap.add_argument("--rotate-180", action="store_true", help="camera mounted upside down")
     a = ap.parse_args()
     sys.exit(collect(a.ws, a.camera, a.out, a.backend, a.fuse, a.align_ms,
                      a.min_pose_conf, a.max_samples, a.fps, a.append,
-                     a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h, a.calib))
+                     a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h, a.calib, a.rotate_180))
 
 
 if __name__ == "__main__":
