@@ -27,6 +27,7 @@ dev = ["pytest>=7"]
 wst-collect = "wifi_sense_trainer.teacher:main"
 wst-train = "wifi_sense_trainer.train:main"
 wst-infer = "wifi_sense_trainer.infer:main"
+wst-calibrate = "wifi_sense_trainer.calibrate:main"
 
 [tool.setuptools.packages.find]
 include = ["wifi_sense_trainer*"]

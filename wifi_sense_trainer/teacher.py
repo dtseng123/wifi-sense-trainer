@@ -111,17 +111,19 @@ def _split_sbs(frame, swap=False, flip_v=False, mirror_h=False):
 
 
 class StereoTeacher:
-    """Metric-depth teacher: 2D pose on the LEFT eye + stereo disparity -> z per
-    keypoint. Defaults match the vr-passthrough USB SBS camera (baseline 65mm,
-    focal 400px). z is normalized to [0,1] over [z_min,z_max] metres for the model.
-    Runs on the existing 3.13 venv (YOLO + OpenCV) — no MediaPipe needed."""
+    """Metric-depth teacher: 2D pose on the left eye + stereo disparity -> z per
+    keypoint. With a calibration (wst-calibrate -> stereo_calib.json) it rectifies
+    both eyes and uses reprojectImageTo3D(Q) for true metric Z; without one it
+    falls back to nominal baseline*focal/disparity. z is normalized to [0,1] over
+    [z_min,z_max] metres. Uses RAW geometric eyes (no mirror) — mirroring is a
+    display setting that breaks stereo geometry. Runs on the 3.13 venv (YOLO+cv2)."""
     name = "stereo"
 
     def __init__(self, min_conf=0.5, baseline_m=0.065, focal_px=400.0,
-                 swap_eyes=False, flip_v=True, mirror_h=True,
-                 z_min=0.3, z_max=5.0, pose_backend="yolo"):
+                 swap_eyes=False, flip_v=False, mirror_h=False,
+                 z_min=0.3, z_max=5.0, pose_backend="yolo", calib=None):
         import cv2
-        self.pose = make_teacher(pose_backend, min_conf)  # 2D keypoints on left eye
+        self.pose = make_teacher(pose_backend, min_conf)
         self.baseline, self.focal = baseline_m, focal_px
         self.swap, self.flip_v, self.mirror_h = swap_eyes, flip_v, mirror_h
         self.z_min, self.z_max = z_min, z_max
@@ -129,29 +131,47 @@ class StereoTeacher:
             minDisparity=0, numDisparities=96, blockSize=7,
             P1=8 * 3 * 49, P2=32 * 3 * 49, uniquenessRatio=10,
             speckleWindowSize=50, speckleRange=2, disp12MaxDiff=1)
+        self.rect = None
+        if calib:
+            c = json.load(open(calib)) if isinstance(calib, str) else calib
+            size = tuple(c["image_size"])
+            K1, D1 = np.array(c["K1"]), np.array(c["D1"])
+            K2, D2 = np.array(c["K2"]), np.array(c["D2"])
+            self.Q = np.array(c["Q"])
+            self.m1 = cv2.initUndistortRectifyMap(K1, D1, np.array(c["R1"]), np.array(c["P1"]), size, cv2.CV_32FC1)
+            self.m2 = cv2.initUndistortRectifyMap(K2, D2, np.array(c["R2"]), np.array(c["P2"]), size, cv2.CV_32FC1)
+            self.swap = bool(c.get("swap_eyes", self.swap))
+            self.rect = True
+            print(f"[stereo] calibrated: baseline {c.get('baseline_m', 0) * 1000:.0f}mm "
+                  f"fx {c.get('fx', 0):.0f}px", flush=True)
 
     def infer(self, frame):
         import cv2
         left, right = _split_sbs(frame, self.swap, self.flip_v, self.mirror_h)
-        kp, conf = self.pose.infer(left)  # x,y normalized to LEFT eye
+        if self.rect:
+            left = cv2.remap(left, self.m1[0], self.m1[1], cv2.INTER_LINEAR)
+            right = cv2.remap(right, self.m2[0], self.m2[1], cv2.INTER_LINEAR)
+        kp, conf = self.pose.infer(left)  # x,y normalized to (rectified) left eye
         if kp is None:
             return None, 0.0
         gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
         gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
-        disp = self.matcher.compute(gl, gr).astype(np.float32) / 16.0  # pixels
+        disp = self.matcher.compute(gl, gr).astype(np.float32) / 16.0
         H, W = gl.shape
         span = max(self.z_max - self.z_min, 1e-6)
+        xyz = cv2.reprojectImageTo3D(disp, self.Q) if self.rect else None
         for i in range(N_KP):
             x = int(min(max(kp[i, 0] * W, 0), W - 1))
             y = int(min(max(kp[i, 1] * H, 0), H - 1))
-            win = disp[max(0, y - 3):y + 4, max(0, x - 3):x + 4]
-            valid = win[win > 0.5]
-            if valid.size:
-                d = float(np.median(valid))
-                z = (self.baseline * self.focal) / d  # metres
-                kp[i, 2] = (min(max(z, self.z_min), self.z_max) - self.z_min) / span
+            if self.rect:
+                win = xyz[max(0, y - 3):y + 4, max(0, x - 3):x + 4, 2]
+                valid = win[np.isfinite(win) & (win > 0) & (win < self.z_max * 2)]
+                z = float(np.median(valid)) if valid.size else 0.0
             else:
-                kp[i, 2] = 0.0
+                win = disp[max(0, y - 3):y + 4, max(0, x - 3):x + 4]
+                valid = win[win > 0.5]
+                z = (self.baseline * self.focal) / float(np.median(valid)) if valid.size else 0.0
+            kp[i, 2] = (min(max(z, self.z_min), self.z_max) - self.z_min) / span if z > 0 else 0.0
         return kp, conf
 
 
@@ -207,12 +227,12 @@ class CsiBuffer:
 def collect(ws, camera, out, backend="yolo", fuse="mean", align_ms=60.0,
             min_pose_conf=0.5, max_samples=0, fps=8.0, append=False,
             stereo_width=0, baseline_m=0.065, focal_px=400.0,
-            swap_eyes=False, flip_v=True, mirror_h=True):
+            swap_eyes=False, flip_v=False, mirror_h=False, calib=None):
     import cv2  # noqa
     os.makedirs(out, exist_ok=True)
     tol = align_ms / 1000.0
     teacher = (make_teacher("stereo", min_pose_conf, baseline_m=baseline_m, focal_px=focal_px,
-                            swap_eyes=swap_eyes, flip_v=flip_v, mirror_h=mirror_h)
+                            swap_eyes=swap_eyes, flip_v=flip_v, mirror_h=mirror_h, calib=calib)
                if backend == "stereo" else make_teacher(backend, min_pose_conf))
     csi = CsiBuffer(ws, fuse)
     csi.start()
@@ -303,12 +323,13 @@ def main():
     ap.add_argument("--baseline", type=float, default=0.065, help="camera baseline in metres")
     ap.add_argument("--focal", type=float, default=400.0, help="focal length in pixels")
     ap.add_argument("--swap-eyes", action="store_true")
-    ap.add_argument("--no-flip-v", dest="flip_v", action="store_false")
-    ap.add_argument("--no-mirror-h", dest="mirror_h", action="store_false")
+    ap.add_argument("--flip-v", action="store_true", help="(display only; leave off for depth)")
+    ap.add_argument("--mirror-h", action="store_true", help="(display only; breaks stereo geometry)")
+    ap.add_argument("--calib", default=None, help="stereo_calib.json from wst-calibrate (metric depth)")
     a = ap.parse_args()
     sys.exit(collect(a.ws, a.camera, a.out, a.backend, a.fuse, a.align_ms,
                      a.min_pose_conf, a.max_samples, a.fps, a.append,
-                     a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h))
+                     a.stereo_width, a.baseline, a.focal, a.swap_eyes, a.flip_v, a.mirror_h, a.calib))
 
 
 if __name__ == "__main__":
