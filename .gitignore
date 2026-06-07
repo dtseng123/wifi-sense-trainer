@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+# data + trained artifacts
+dataset/
+*.npy
+*.pt
+*.onnx
+*.rvf
+yolov8*.pt
